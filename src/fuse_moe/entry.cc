@@ -273,7 +273,7 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
                              const torch::Tensor &topk_scale,
                              std::optional<torch::Tensor> shared_output, int64_t rank_ep,
                              int64_t num_expert_total, bool use_bf16_mul,
-                             std::optional<torch::Tensor> output) {
+                             std::optional<torch::Tensor> output, bool do_gated_gemm) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn &&
@@ -332,7 +332,8 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   int num_tokens_per_group_avg = num_seq * num_topk / num_expert_total;
   TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
-  if (intermediate_size / 2 <= 512 && (intermediate_size / 2) % 64 == 0 && hidden_size % 64 == 0) {
+  if (!do_gated_gemm && intermediate_size / 2 <= 512 &&
+      (intermediate_size / 2) % 64 == 0 && hidden_size % 64 == 0) {
     return fuse_moe_cp_async_entry(x, gate_up_weight, down_weight, gate_up_scale, down_scale,
                                    act_and_mul_scale, topk_ids, topk_scale, shared_output, rank_ep,
                                    num_expert_total, use_bf16_mul, output);
@@ -434,7 +435,7 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
                  topk_scale_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr,
                  shared_output_ptr, gateup_task_map_ptr, down_task_map_ptr, num_gateup_waves,
                  num_down_waves, num_seq, hidden_size, intermediate_size, num_topk,
-                 num_expert_total, num_expert, rank_ep, use_bf16_mul, stream);
+                 num_expert_total, num_expert, rank_ep, use_bf16_mul, do_gated_gemm, stream);
   if (output.has_value()) {
     return output.value();
   } else {
@@ -657,14 +658,15 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "fuse_moe(Tensor x, Tensor gate_up_weight, Tensor down_weight, Tensor gate_up_scale, "
       "Tensor down_scale, Tensor act_and_mul_scale, Tensor topk_ids, Tensor topk_scale, Tensor ? "
       "shared_output, "
-      "int rank_ep, int num_expert_total, bool use_bf16_mul, Tensor ? output) -> (Tensor)");
+      "int rank_ep, int num_expert_total, bool use_bf16_mul, Tensor ? output, "
+      "bool do_gated_gemm=False) -> (Tensor)");
   m.impl("fuse_moe", torch::kCUDA, &hpc::fuse_moe::fuse_moe_entry);
 
   m.def(
       "fuse_moe_pertensor_fp8(Tensor x, Tensor gate_up_weight, Tensor down_weight, Tensor "
       "gate_up_scale, Tensor down_scale, Tensor act_and_mul_scale, Tensor topk_ids, Tensor "
       "topk_scale, Tensor ? shared_output, int rank_ep, int num_expert_total, bool use_bf16_mul, "
-      "Tensor ? output) -> (Tensor)");
+      "Tensor ? output, bool do_gated_gemm=False) -> (Tensor)");
   m.impl("fuse_moe_pertensor_fp8", torch::kCUDA, &hpc::fuse_moe::fuse_moe_entry);
 
   m.def(

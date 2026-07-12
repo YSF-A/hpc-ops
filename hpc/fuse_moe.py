@@ -147,6 +147,7 @@ def fuse_moe(
     use_bf16_mul: bool = True,
     shared_output: Tensor = None,
     output: Tensor = None,
+    do_gated_gemm: bool = False,
 ) -> Tensor:
     """Run per-tensor FP8 FusedMoE."""
     return torch.ops.hpc.fuse_moe(
@@ -163,6 +164,7 @@ def fuse_moe(
         num_expert_total,
         use_bf16_mul,
         output,
+        do_gated_gemm,
     )
 
 
@@ -179,6 +181,7 @@ def fuse_moe_pertensor_fp8(
     num_expert_total: int,
     use_bf16_mul: bool = True,
     shared_output: Tensor = None,
+    do_gated_gemm: bool = False,
 ) -> Tensor:
     """Run per-tensor FP8 FusedMoE."""
 
@@ -196,6 +199,7 @@ def fuse_moe_pertensor_fp8(
         num_expert_total,
         use_bf16_mul,
         None,
+        do_gated_gemm,
     )
 
 
@@ -298,6 +302,7 @@ def fuse_moe_fake(
     num_expert_total,
     use_bf16_mul,
     output,
+    do_gated_gemm,
 ):
     return (
         output
@@ -321,6 +326,7 @@ def fuse_moe_pertensor_fp8_fake(
     num_expert_total,
     use_bf16_mul,
     output,
+    do_gated_gemm,
 ):
     return (
         output

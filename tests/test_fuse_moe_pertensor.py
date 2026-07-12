@@ -92,13 +92,16 @@ def naive_group_gemm(x, w, cu_seqlens, scale, expert_ids):
     return y
 
 
-def naive_act_mul_and_quant(gate_up, scale):
+def naive_act_mul_and_quant(gate_up, scale, use_bf16_mul=True):
 
     def silu(x):
         return x / (1 + (-x).exp())
 
     gate, up = torch.chunk(gate_up.float(), 2, dim=1)
-    out = (silu(gate).to(torch.bfloat16) * up.to(torch.bfloat16)).float() * scale
+    if use_bf16_mul:
+        out = (silu(gate).to(torch.bfloat16) * up.to(torch.bfloat16)).float() * scale
+    else:
+        out = silu(gate) * up * scale
     outfp8 = out.to(torch.float8_e4m3fn)
     return outfp8
 
@@ -127,6 +130,7 @@ def naive_fuse_moe_pertensor_fp8(
     topk_scale,
     rank_ep,
     shared_output=None,
+    use_bf16_mul=True,
 ):
     num_expert = gate_up_weight.size(0)
     # count_and_gather
@@ -140,7 +144,7 @@ def naive_fuse_moe_pertensor_fp8(
     )
 
     # act_and_mul
-    down_input = naive_act_mul_and_quant(gate_up_output, act_and_mul_scale)
+    down_input = naive_act_mul_and_quant(gate_up_output, act_and_mul_scale, use_bf16_mul)
 
     # down_proj
     down_output = naive_group_gemm(down_input, down_weight, cu_seqlens, down_scale, expert_ids)
@@ -159,6 +163,8 @@ def naive_fuse_moe_pertensor_fp8(
 @pytest.mark.parametrize("rank_ep", [0, 1])
 @pytest.mark.parametrize("size_ep", [1, 4, 8])
 @pytest.mark.parametrize("has_shared_output", [False, True])
+@pytest.mark.parametrize("do_gated_gemm", [False, True])
+@pytest.mark.parametrize("use_bf16_mul", [False, True])
 def test_fuse_moe_pertensor_fp8(
     num_seq,
     num_topk,
@@ -168,6 +174,8 @@ def test_fuse_moe_pertensor_fp8(
     rank_ep,
     size_ep,
     has_shared_output,
+    do_gated_gemm,
+    use_bf16_mul,
 ):
     dtype = torch.float8_e4m3fn
 
@@ -205,7 +213,9 @@ def test_fuse_moe_pertensor_fp8(
         topk_scale,
         rank_ep,
         num_expert // size_ep,
+        use_bf16_mul=use_bf16_mul,
         shared_output=shared_output,
+        do_gated_gemm=do_gated_gemm,
     )
     gt = naive_fuse_moe_pertensor_fp8(
         x,
@@ -218,6 +228,7 @@ def test_fuse_moe_pertensor_fp8(
         topk_scale,
         rank_ep,
         shared_output,
+        use_bf16_mul,
     )
 
     assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.08, atol=0.1)

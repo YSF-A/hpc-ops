@@ -45,7 +45,8 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
                     const void *shared_output_ptr, void *gateup_task_map_ptr,
                     void *down_task_map_ptr, int num_gateup_waves, int num_down_waves, int num_seq,
                     int hidden_size, int intermediate_size, int num_topk, int num_expert_total,
-                    int num_expert_local, int rank_ep, bool use_bf16_mul, cudaStream_t stream);
+                    int num_expert_local, int rank_ep, bool use_bf16_mul, bool do_gated_gemm,
+                    cudaStream_t stream);
 
 void fuse_moe_blockwise_async(
     void *output_ptr, const void *input_ptr, const void *input_scale_ptr, void *gate_up_input_ptr,
