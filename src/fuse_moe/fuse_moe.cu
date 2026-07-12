@@ -42,8 +42,9 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
   if (do_gated_gemm) {
     group_gemm::group_gated_gemm_fp8_async(
         down_input_ptr, gate_up_input_ptr, gate_up_weight_ptr, seqlens_ptr,
-        cu_seqlens_ptr, gate_up_scale_ptr, act_and_mul_scale_ptr, num_expert_local,
-        total_num_seq, intermediate_size / 2, hidden_size, use_bf16_mul, use_pdl, stream);
+        cu_seqlens_ptr, gate_up_scale_ptr, act_and_mul_scale_ptr, gate_up_tmas_ptr,
+        tiles_ptr, num_expert_local, total_num_seq, intermediate_size / 2, hidden_size,
+        num_seq_per_group_avg, use_bf16_mul, use_pdl, stream);
   } else {
     group_gemm::group_gemm_fp8_async(
         gate_up_output_ptr, gate_up_input_ptr, gate_up_weight_ptr, seqlens_ptr,
