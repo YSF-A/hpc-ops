@@ -141,6 +141,11 @@ __global__ void __launch_bounds__(384, 1) group_gated_gemm_fp8_kernel(
         }
         iblock += gridDim.x;
         auto *td_x = td_xy + igroup * 2;
+        // count_and_gather publishes the per-expert tensor map with a generic
+        // store. Acquire it in the TMA issuing warp before the first load.
+        // Policy-0 performed this while prefetching task-map entries, whereas
+        // horizon/vertical scheduling reaches this point directly.
+        tma_descriptor_fence_acquire(td_x);
 #pragma unroll 1
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
           wait_barrier(writable[ismem_write], phase);
