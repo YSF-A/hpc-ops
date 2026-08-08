@@ -9,11 +9,10 @@ namespace hpc {
 namespace group_gemm {
 namespace kernels {
 
-template <typename Config, typename TmaA, typename TmaBGate, typename TmaBUp, typename TmaD,
+template <typename Config, typename TmaA, typename TmaBGate, typename TmaBUp,
           int kTaskLoopPolicy, bool kUseBFloat16PrecisionMultiply, bool kUsePDL>
 __global__ void __launch_bounds__(384, 1) group_gated_gemm_fp8_kernel(
     const __grid_constant__ TmaBGate tma_b_gate, const __grid_constant__ TmaBUp tma_b_up,
-    const __grid_constant__ TmaD tma_d,
     cute::TmaDescriptor *td_xy, const int *seqlens_ptr, const int *cu_seqlens_ptr,
     const float *gate_up_scale_ptr, const float *act_scale_ptr, int *tiles_ptr,
     int *cu_tiles_ptr, int4 *task_map_ptr, typename Config::Tin *output_ptr, int num_group,
@@ -405,16 +404,11 @@ void launch_group_gated_gemm_fp8(
                            make_shape(n, k, num_group), make_stride(k, Int<1>{}, 2 * n * k));
   auto WUp = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(weight_ptr) + n * k),
                          make_shape(n, k, num_group), make_stride(k, Int<1>{}, 2 * n * k));
-  auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<Tin *>(y_ptr)), make_shape(n, m),
-                       make_stride(Int<1>{}, n));
   using SLayoutDAtom = decltype(slayout_selector<64, Tin, false>());
   using SLayoutD = decltype(tile_to_shape(SLayoutDAtom{}, make_shape(Int<kTileN>{}, Int<kTileM>{})));
-  using CopyBoxD = decltype(tile_to_shape(
-      SLayoutDAtom{}, make_shape(Int<kTileN / Config::kWarpgroupM>{}, Int<kTileM>{})));
   auto tma_b_gate = make_tma_copy(SM90_TMA_LOAD{}, WGate, take<0, 2>(typename Config::SLayoutW{}));
   auto tma_b_up = make_tma_copy(SM90_TMA_LOAD{}, WUp, take<0, 2>(typename Config::SLayoutW{}));
   auto tma_a = make_tma_copy(SM90_TMA_LOAD{}, X, take<0, 2>(typename Config::SLayoutX{}));
-  auto tma_d = make_tma_copy(SM90_TMA_STORE{}, Y, CopyBoxD{});
   int num_tile_n = (n + kTileN - 1) / kTileN;
   cutlass::FastDivmod flat_divider(num_tile_n);
   if constexpr (kTaskLoopPolicy == 0) {
@@ -456,7 +450,7 @@ void launch_group_gated_gemm_fp8(
                  (kTaskLoopPolicy == 0 ? sizeof(int4) * num_waves
                                         : sizeof(int) * (num_group + 1));
   auto kernel = kernels::group_gated_gemm_fp8_kernel<
-      Config, decltype(tma_a), decltype(tma_b_gate), decltype(tma_b_up), decltype(tma_d),
+      Config, decltype(tma_a), decltype(tma_b_gate), decltype(tma_b_up),
       kTaskLoopPolicy, kUseBFloat16PrecisionMultiply, kUsePDL>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
   cudaLaunchConfig_t cfg{};
@@ -471,7 +465,7 @@ void launch_group_gated_gemm_fp8(
     cfg.attrs = attr;
     cfg.numAttrs = 1;
   }
-  cudaLaunchKernelEx(&cfg, kernel, tma_b_gate, tma_b_up, tma_d,
+  cudaLaunchKernelEx(&cfg, kernel, tma_b_gate, tma_b_up,
                      static_cast<cute::TmaDescriptor *>(tmas_ptr),
                      static_cast<const int *>(seqlens_ptr),
                      static_cast<const int *>(cu_seqlens_ptr),
