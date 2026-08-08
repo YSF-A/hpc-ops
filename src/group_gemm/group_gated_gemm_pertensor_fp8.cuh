@@ -16,7 +16,8 @@ __global__ void __launch_bounds__(384, 1) group_gated_gemm_fp8_kernel(
     const __grid_constant__ TmaD tma_d,
     cute::TmaDescriptor *td_xy, const int *seqlens_ptr, const int *cu_seqlens_ptr,
     const float *gate_up_scale_ptr, const float *act_scale_ptr, int *tiles_ptr,
-    int *cu_tiles_ptr, int4 *task_map_ptr, int num_group, int m, int n, int k,
+    int *cu_tiles_ptr, int4 *task_map_ptr, typename Config::Tin *output_ptr, int num_group,
+    int m, int n, int k,
     cutlass::FastDivmod flat_divider) {
   using namespace cute;  // NOLINT
   using Tin = typename Config::Tin;
@@ -269,18 +270,37 @@ __global__ void __launch_bounds__(384, 1) group_gated_gemm_fp8_kernel(
       syncwarpgroup(iwarpgroup);
       copy(tiled_copy, thr_copy.retile_S(tOut), tSOut);
       syncwarpgroup(iwarpgroup);
-      cute::tma_store_fence();
-
-      bool is_leader_in_warpgroup = ((iwarp % 4) == 0) && elected;
-      if (is_leader_in_warpgroup) {
-        auto gD = tma_d.get_tma_tensor(make_shape(n, m));
-        auto btma_d = tma_d.get_slice(0);
-        auto tDs = btma_d.partition_S(sOut);
-        auto tDg = btma_d.partition_D(gD);
-        auto *td_y = td_xy + igroup * 2 + 1;
-        cute::copy(tma_d.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
-                   tDg(_, itile_n * Config::kWarpgroupM + iwarpgroup, itile_m));
-        tma_store_arrive();
+      int group_rows = seqlens_ptr[igroup];
+      int row_start = cu_seqlens_ptr[igroup] + itile_m * Config::kTileM;
+      bool is_full_tile = row_start + Config::kTileM <= m &&
+                          group_rows - itile_m * Config::kTileM >= Config::kTileM &&
+                          (itile_n + 1) * Config::kTileN <= n;
+      if (is_full_tile) {
+        cute::tma_store_fence();
+        bool is_leader_in_warpgroup = ((iwarp % 4) == 0) && elected;
+        if (is_leader_in_warpgroup) {
+          auto gD = tma_d.get_tma_tensor(make_shape(n, m));
+          auto btma_d = tma_d.get_slice(0);
+          auto tDs = btma_d.partition_S(sOut);
+          auto tDg = btma_d.partition_D(gD);
+          auto *td_y = td_xy + igroup * 2 + 1;
+          cute::copy(tma_d.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
+                     tDg(_, itile_n * Config::kWarpgroupM + iwarpgroup, itile_m));
+          tma_store_arrive();
+        }
+      } else {
+        constexpr int kWarpgroupTileN = Config::kTileN / Config::kWarpgroupM;
+#pragma unroll
+        for (int linear = idx % 128; linear < kWarpgroupTileN * Config::kTileM;
+             linear += 128) {
+          int local_n = iwarpgroup * kWarpgroupTileN + linear / Config::kTileM;
+          int local_m = linear % Config::kTileM;
+          int row = row_start + local_m;
+          int col = itile_n * Config::kTileN + local_n;
+          if (local_m < group_rows - itile_m * Config::kTileM && row < m && col < n) {
+            output_ptr[static_cast<int64_t>(row) * n + col] = sOut(local_n, local_m);
+          }
+        }
       }
     }
   }
@@ -494,7 +514,7 @@ void launch_group_gated_gemm_fp8(
                      static_cast<const float *>(gate_up_scale_ptr),
                      static_cast<const float *>(act_scale_ptr), static_cast<int *>(tiles_ptr),
                      static_cast<int *>(cu_tiles_ptr), static_cast<int4 *>(task_map_ptr),
-                     num_group, m, n, k, flat_divider);
+                     static_cast<Tin *>(y_ptr), num_group, m, n, k, flat_divider);
 }
 
 void group_gated_gemm_fp8_async(
