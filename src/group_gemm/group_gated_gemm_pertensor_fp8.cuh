@@ -272,34 +272,18 @@ __global__ void __launch_bounds__(384, 1) group_gated_gemm_fp8_kernel(
       syncwarpgroup(iwarpgroup);
       int group_rows = seqlens_ptr[igroup];
       int row_start = cu_seqlens_ptr[igroup] + itile_m * Config::kTileM;
-      bool is_full_tile = row_start + Config::kTileM <= m &&
-                          group_rows - itile_m * Config::kTileM >= Config::kTileM &&
-                          (itile_n + 1) * Config::kTileN <= n;
-      if (is_full_tile) {
-        cute::tma_store_fence();
-        bool is_leader_in_warpgroup = ((iwarp % 4) == 0) && elected;
-        if (is_leader_in_warpgroup) {
-          auto gD = tma_d.get_tma_tensor(make_shape(n, m));
-          auto btma_d = tma_d.get_slice(0);
-          auto tDs = btma_d.partition_S(sOut);
-          auto tDg = btma_d.partition_D(gD);
-          auto *td_y = td_xy + igroup * 2 + 1;
-          cute::copy(tma_d.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
-                     tDg(_, itile_n * Config::kWarpgroupM + iwarpgroup, itile_m));
-          tma_store_arrive();
-        }
-      } else {
-        constexpr int kWarpgroupTileN = Config::kTileN / Config::kWarpgroupM;
+      // Keep the grouped writeback scalar while validating the dynamic output
+      // descriptor path. Input and weight transfers remain TMA based.
+      constexpr int kWarpgroupTileN = Config::kTileN / Config::kWarpgroupM;
 #pragma unroll
-        for (int linear = idx % 128; linear < kWarpgroupTileN * Config::kTileM;
-             linear += 128) {
-          int local_n = iwarpgroup * kWarpgroupTileN + linear / Config::kTileM;
-          int local_m = linear % Config::kTileM;
-          int row = row_start + local_m;
-          int col = itile_n * Config::kTileN + local_n;
-          if (local_m < group_rows - itile_m * Config::kTileM && row < m && col < n) {
-            output_ptr[static_cast<int64_t>(row) * n + col] = sOut(local_n, local_m);
-          }
+      for (int linear = idx % 128; linear < kWarpgroupTileN * Config::kTileM;
+           linear += 128) {
+        int local_n = iwarpgroup * kWarpgroupTileN + linear / Config::kTileM;
+        int local_m = linear % Config::kTileM;
+        int row = row_start + local_m;
+        int col = itile_n * Config::kTileN + local_n;
+        if (local_m < group_rows - itile_m * Config::kTileM && row < m && col < n) {
+          output_ptr[static_cast<int64_t>(row) * n + col] = sOut(local_n, local_m);
         }
       }
     }
@@ -321,7 +305,8 @@ __global__ void update_grouped_gated_output_tma(cute::TmaDescriptor td_y,
   int idx = threadIdx.x;
   int igroup = blockIdx.x;
 
-  if constexpr (kUsePDL) {
+  constexpr bool kEnableOutputTmaStore = false;
+  if constexpr (kEnableOutputTmaStore && kUsePDL) {
     cudaGridDependencySynchronize();
   }
 
@@ -379,7 +364,7 @@ __global__ void build_gated_task_map_kernel(int4 *task_map_ptr, const int *cu_ti
       task.w = 0;
       task_map_ptr[cu_tiles + i] = task;
     }
-  } else {
+  } else if constexpr (kEnableOutputTmaStore) {
     int tail_id = blockIdx.x - num_group;
     int tail_blocks = gridDim.x - num_group;
     int used = cu_tiles_ptr[num_group] * num_tile_n;
@@ -432,27 +417,6 @@ void launch_group_gated_gemm_fp8(
   auto tma_d = make_tma_copy(SM90_TMA_STORE{}, Y, CopyBoxD{});
   int num_tile_n = (n + kTileN - 1) / kTileN;
   cutlass::FastDivmod flat_divider(num_tile_n);
-  if constexpr (kUsePDL) {
-    cudaLaunchAttribute attr[1];
-    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attr[0].val.programmaticStreamSerializationAllowed = 1;
-    cudaLaunchConfig_t cfg{};
-    cfg.gridDim = dim3(num_group);
-    cfg.blockDim = dim3(32);
-    cfg.dynamicSmemBytes = 0;
-    cfg.stream = stream;
-    cfg.attrs = attr;
-    cfg.numAttrs = 1;
-    cudaLaunchKernelEx(&cfg, kernels::update_grouped_gated_output_tma<Tin, decltype(tma_d), true>,
-                       *tma_d.get_tma_descriptor(), static_cast<cute::TmaDescriptor *>(tmas_ptr),
-                       static_cast<const Tin *>(y_ptr), static_cast<const int *>(seqlens_ptr),
-                       static_cast<const int *>(cu_seqlens_ptr), num_group, m, n);
-  } else {
-    kernels::update_grouped_gated_output_tma<Tin, decltype(tma_d), false><<<num_group, 32, 0, stream>>>(
-        *tma_d.get_tma_descriptor(), static_cast<cute::TmaDescriptor *>(tmas_ptr),
-        static_cast<const Tin *>(y_ptr), static_cast<const int *>(seqlens_ptr),
-        static_cast<const int *>(cu_seqlens_ptr), num_group, m, n);
-  }
   if constexpr (kTaskLoopPolicy == 0) {
     int task_map_len = num_waves * get_sm_count();
     constexpr int kBlockSize = 128;
