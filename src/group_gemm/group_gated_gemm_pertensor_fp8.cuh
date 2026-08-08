@@ -517,9 +517,7 @@ void group_gated_gemm_fp8_async(
   } while (0)
 #define DISPATCH(BF, PDL)                                                            \
   do {                                                                               \
-    if (task_map_ptr != nullptr && num_seq_per_group_avg <= 8) {                     \
-      DISPATCH_TM(0, BF, PDL);                                                       \
-    } else if (k > 1024 && n > 1024 && cu_tiles_ptr != nullptr) {                    \
+    if (k > 1024 && n > 1024 && cu_tiles_ptr != nullptr) {                           \
       DISPATCH_TM(2, BF, PDL);                                                       \
     } else {                                                                         \
       DISPATCH_TM(1, BF, PDL);                                                       \
