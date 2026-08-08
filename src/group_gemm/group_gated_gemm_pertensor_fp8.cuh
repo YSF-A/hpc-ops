@@ -9,14 +9,14 @@ namespace hpc {
 namespace group_gemm {
 namespace kernels {
 
-template <typename Config, typename TmaA, typename TmaBGate, typename TmaBUp,
+template <typename Config, typename TmaA, typename TmaBGate, typename TmaBUp, typename TmaD,
           int kTaskLoopPolicy, bool kUseBFloat16PrecisionMultiply, bool kUsePDL>
 __global__ void __launch_bounds__(384, 1) group_gated_gemm_fp8_kernel(
     const __grid_constant__ TmaBGate tma_b_gate, const __grid_constant__ TmaBUp tma_b_up,
+    const __grid_constant__ TmaD tma_d,
     cute::TmaDescriptor *td_xy, const int *seqlens_ptr, const int *cu_seqlens_ptr,
     const float *gate_up_scale_ptr, const float *act_scale_ptr, int *tiles_ptr,
-    int *cu_tiles_ptr, int4 *task_map_ptr, cute::float_e4m3_t *output_ptr,
-    int num_group, int m, int n, int k,
+    int *cu_tiles_ptr, int4 *task_map_ptr, int num_group, int m, int n, int k,
     cutlass::FastDivmod flat_divider) {
   using namespace cute;  // NOLINT
   using Tin = typename Config::Tin;
@@ -24,8 +24,10 @@ __global__ void __launch_bounds__(384, 1) group_gated_gemm_fp8_kernel(
   using TiledMma = typename Config::TiledMma;
   using SLayoutA = typename Config::SLayoutX;
   using SLayoutB = typename Config::SLayoutW;
-  using SLayoutC = typename Config::SLayoutY;
-  using TFused = std::conditional_t<kUseBFloat16PrecisionMultiply, Tout, float>;
+  using SLayoutDAtom = decltype(slayout_selector<64, Tin, false>());
+  using SLayoutD =
+      decltype(tile_to_shape(SLayoutDAtom{}, cute::make_shape(cute::Int<Config::kTileN>{},
+                                                              cute::Int<Config::kTileM>{})));
   constexpr int kTileM = Config::kTileM;
   constexpr int kTileN = Config::kTileN;
   constexpr int kTileK = Config::kTileK;
@@ -43,9 +45,9 @@ __global__ void __launch_bounds__(384, 1) group_gated_gemm_fp8_kernel(
   auto *shm_a = reinterpret_cast<Tin *>(shm_data);
   auto *shm_gate = shm_a + cosize(SLayoutA{});
   auto *shm_up = shm_gate + cosize(SLayoutB{});
-  auto *shm_out = reinterpret_cast<TFused *>(shm_up + cosize(SLayoutB{}));
+  auto *shm_out = reinterpret_cast<Tin *>(shm_up + cosize(SLayoutB{}));
   using Ttask = std::conditional_t<kTaskLoopPolicy == 0, int4, int>;
-  auto *shm_tiles = reinterpret_cast<Ttask *>(shm_out + cosize(SLayoutC{}));
+  auto *shm_tiles = reinterpret_cast<Ttask *>(shm_out + cosize(SLayoutD{}));
 
   TmaA tma_a;
   auto sA = make_tensor(make_smem_ptr(shm_a), SLayoutA{});
@@ -244,43 +246,42 @@ __global__ void __launch_bounds__(384, 1) group_gated_gemm_fp8_kernel(
       // Fuse the two accumulator fragments in registers. The explicit BF16
       // conversions preserve the rounding boundary of the unfused path, but
       // gate/up no longer make a round trip through shared memory.
-      auto tOut = make_tensor_like<TFused>(tGateC);
+      auto tOut = make_tensor_like<Tin>(tGateC);
 #pragma unroll
       for (int i = 0; i < size(tGateC); ++i) {
         float gate = static_cast<float>(static_cast<Tout>(tGateD(i)));
         float up = static_cast<float>(static_cast<Tout>(tUpD(i)));
+        float fused;
         if constexpr (kUseBFloat16PrecisionMultiply) {
-          tOut(i) = __bfloat162float(__float2bfloat16_rn(silu(gate)) *
-                                    __float2bfloat16_rn(up));
+          fused = __bfloat162float(__float2bfloat16_rn(silu(gate)) *
+                                   __float2bfloat16_rn(up));
         } else {
-          tOut(i) = silu(gate) * up;
+          fused = silu(gate) * up;
         }
+        tOut(i) = static_cast<Tin>(fused * act_scale_ptr[0]);
       }
-      auto sOut = make_tensor(make_smem_ptr(shm_out), SLayoutC{});
-      using STSMAtom = std::conditional_t<kTileM == 8, SM90_U16x4_STSM_T, SM90_U16x8_STSM_T>;
-      using R2SCopyAtom = std::conditional_t<
-          kUseBFloat16PrecisionMultiply, Copy_Atom<STSMAtom, Tout>,
-          Copy_Atom<UniversalCopy<uint32_t>, float>>;
+      auto sOut = make_tensor(make_smem_ptr(shm_out), SLayoutD{});
+      using R2SCopyAtom = Copy_Atom<UniversalCopy<uint8_t>, Tin>;
       auto tiled_copy = make_tiled_copy_C(R2SCopyAtom{}, tiled_mma);
       auto thr_copy = tiled_copy.get_slice(idx);
       auto tSOut = thr_copy.partition_D(sOut);
+      tma_store_wait<0>();
       syncwarpgroup(iwarpgroup);
       copy(tiled_copy, thr_copy.retile_S(tOut), tSOut);
       syncwarpgroup(iwarpgroup);
+      cute::tma_store_fence();
 
-      constexpr int kWarpgroupTileN = kTileN / Config::kWarpgroupM;
-      int group_rows = seqlens_ptr[igroup];
-      for (int linear = idx % 128; linear < kWarpgroupTileN * kTileM; linear += 128) {
-        int local_n = iwarpgroup * kWarpgroupTileN + linear / kTileM;
-        int local_m = linear % kTileM;
-        int row = cu_seqlens_ptr[igroup] + itile_m * kTileM + local_m;
-        int col = itile_n * kTileN + local_n;
-        if (local_m < group_rows - itile_m * kTileM && row < m && col < n) {
-          output_ptr[static_cast<int64_t>(row) * n + col] =
-              static_cast<cute::float_e4m3_t>(sOut(local_n, local_m) * act_scale_ptr[0]);
-        }
+      bool is_leader_in_warpgroup = ((iwarp % 4) == 0) && elected;
+      if (is_leader_in_warpgroup) {
+        auto gD = tma_d.get_tma_tensor(make_shape(n, m));
+        auto btma_d = tma_d.get_slice(0);
+        auto tDs = btma_d.partition_S(sOut);
+        auto tDg = btma_d.partition_D(gD);
+        auto *td_y = td_xy + igroup * 2 + 1;
+        cute::copy(tma_d.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
+                   tDg(_, itile_n * Config::kWarpgroupM + iwarpgroup, itile_m));
+        tma_store_arrive();
       }
-      syncwarpgroup(iwarpgroup);
     }
   }
   if constexpr (kUsePDL) cudaTriggerProgrammaticLaunchCompletion();
@@ -289,6 +290,50 @@ __global__ void __launch_bounds__(384, 1) group_gated_gemm_fp8_kernel(
 }  // namespace kernels
 
 namespace kernels {
+
+template <typename Tout, typename TmaD, bool kUsePDL>
+__global__ void update_grouped_gated_output_tma(cute::TmaDescriptor td_y,
+                                                cute::TmaDescriptor *td_xy,
+                                                const Tout *y_ptr, const int *seqlens_ptr,
+                                                const int *cu_seqlens_ptr, int num_group,
+                                                int m, int n) {
+  using namespace cute;  // NOLINT
+  int idx = threadIdx.x;
+  int igroup = blockIdx.x;
+
+  if constexpr (kUsePDL) {
+    cudaGridDependencySynchronize();
+  }
+
+  if (igroup < num_group) {
+    __shared__ cute::TmaDescriptor smem_tma_desc;
+    int num_seq = seqlens_ptr[igroup];
+    uint64_t cu_seqlen = cu_seqlens_ptr[igroup];
+    auto *y_ibatch_ptr = y_ptr + cu_seqlen * n;
+
+    if (idx == 0) {
+      smem_tma_desc = td_y;
+    }
+    __syncwarp();
+
+    if (idx == 0) {
+      auto gY = make_tensor(make_gmem_ptr(y_ibatch_ptr), make_shape(n, num_seq),
+                            make_stride(Int<1>{}, n));
+      update_tma_gtensor<TmaD>(smem_tma_desc, gY);
+    }
+
+    __syncwarp();
+    if (cute::elect_one_sync()) {
+      cute::tma_desc_commit_group();
+      cute::tma_desc_wait_group();
+    }
+    tma_descriptor_cp_fence_release(td_xy + igroup * 2 + 1, smem_tma_desc);
+  }
+
+  if constexpr (kUsePDL) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+}
 
 template <bool kUsePDL>
 __global__ void build_gated_task_map_kernel(int4 *task_map_ptr, const int *cu_tiles_ptr,
@@ -355,11 +400,39 @@ void launch_group_gated_gemm_fp8(
                            make_shape(n, k, num_group), make_stride(k, Int<1>{}, 2 * n * k));
   auto WUp = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(weight_ptr) + n * k),
                          make_shape(n, k, num_group), make_stride(k, Int<1>{}, 2 * n * k));
+  auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<Tin *>(y_ptr)), make_shape(n, m),
+                       make_stride(Int<1>{}, n));
+  using SLayoutDAtom = decltype(slayout_selector<64, Tin, false>());
+  using SLayoutD = decltype(tile_to_shape(SLayoutDAtom{}, make_shape(Int<kTileN>{}, Int<kTileM>{})));
+  using CopyBoxD = decltype(tile_to_shape(
+      SLayoutDAtom{}, make_shape(Int<kTileN / Config::kWarpgroupM>{}, Int<kTileM>{})));
   auto tma_b_gate = make_tma_copy(SM90_TMA_LOAD{}, WGate, take<0, 2>(typename Config::SLayoutW{}));
   auto tma_b_up = make_tma_copy(SM90_TMA_LOAD{}, WUp, take<0, 2>(typename Config::SLayoutW{}));
   auto tma_a = make_tma_copy(SM90_TMA_LOAD{}, X, take<0, 2>(typename Config::SLayoutX{}));
+  auto tma_d = make_tma_copy(SM90_TMA_STORE{}, Y, CopyBoxD{});
   int num_tile_n = (n + kTileN - 1) / kTileN;
   cutlass::FastDivmod flat_divider(num_tile_n);
+  if constexpr (kUsePDL) {
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = dim3(num_group);
+    cfg.blockDim = dim3(32);
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, kernels::update_grouped_gated_output_tma<Tin, decltype(tma_d), true>,
+                       *tma_d.get_tma_descriptor(), static_cast<cute::TmaDescriptor *>(tmas_ptr),
+                       static_cast<const Tin *>(y_ptr), static_cast<const int *>(seqlens_ptr),
+                       static_cast<const int *>(cu_seqlens_ptr), num_group, m, n);
+  } else {
+    kernels::update_grouped_gated_output_tma<Tin, decltype(tma_d), false><<<num_group, 32, 0, stream>>>(
+        *tma_d.get_tma_descriptor(), static_cast<cute::TmaDescriptor *>(tmas_ptr),
+        static_cast<const Tin *>(y_ptr), static_cast<const int *>(seqlens_ptr),
+        static_cast<const int *>(cu_seqlens_ptr), num_group, m, n);
+  }
   if constexpr (kTaskLoopPolicy == 0) {
     int task_map_len = num_waves * get_sm_count();
     constexpr int kBlockSize = 128;
@@ -394,13 +467,12 @@ void launch_group_gated_gemm_fp8(
     }
   }
   int shm_size = (cosize(typename Config::SLayoutX{}) + 2 * cosize(typename Config::SLayoutW{})) *
-                     sizeof(Tin) +
-                 cosize(typename Config::SLayoutY{}) *
-                     sizeof(std::conditional_t<kUseBFloat16PrecisionMultiply, Tout, float>) +
+                 sizeof(Tin) +
+                 cosize(SLayoutD{}) * sizeof(Tin) +
                  (kTaskLoopPolicy == 0 ? sizeof(int4) * num_waves
                                         : sizeof(int) * (num_group + 1));
   auto kernel = kernels::group_gated_gemm_fp8_kernel<
-      Config, decltype(tma_a), decltype(tma_b_gate), decltype(tma_b_up),
+      Config, decltype(tma_a), decltype(tma_b_gate), decltype(tma_b_up), decltype(tma_d),
       kTaskLoopPolicy, kUseBFloat16PrecisionMultiply, kUsePDL>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
   cudaLaunchConfig_t cfg{};
@@ -415,14 +487,14 @@ void launch_group_gated_gemm_fp8(
     cfg.attrs = attr;
     cfg.numAttrs = 1;
   }
-  cudaLaunchKernelEx(&cfg, kernel, tma_b_gate, tma_b_up,
+  cudaLaunchKernelEx(&cfg, kernel, tma_b_gate, tma_b_up, tma_d,
                      static_cast<cute::TmaDescriptor *>(tmas_ptr),
                      static_cast<const int *>(seqlens_ptr),
                      static_cast<const int *>(cu_seqlens_ptr),
                      static_cast<const float *>(gate_up_scale_ptr),
                      static_cast<const float *>(act_scale_ptr), static_cast<int *>(tiles_ptr),
                      static_cast<int *>(cu_tiles_ptr), static_cast<int4 *>(task_map_ptr),
-                     static_cast<Tin *>(y_ptr), num_group, m, n, k, flat_divider);
+                     num_group, m, n, k, flat_divider);
 }
 
 void group_gated_gemm_fp8_async(
