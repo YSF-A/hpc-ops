@@ -364,7 +364,7 @@ __global__ void build_gated_task_map_kernel(int4 *task_map_ptr, const int *cu_ti
       task.w = 0;
       task_map_ptr[cu_tiles + i] = task;
     }
-  } else if constexpr (kEnableOutputTmaStore) {
+  } else {
     int tail_id = blockIdx.x - num_group;
     int tail_blocks = gridDim.x - num_group;
     int used = cu_tiles_ptr[num_group] * num_tile_n;
