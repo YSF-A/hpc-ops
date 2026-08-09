@@ -15,7 +15,8 @@ namespace fuse_moe {
 namespace {
 
 void debug_sync_stage(cudaStream_t stream, const char *stage) {
-  if (std::getenv("HPC_FUSE_MOE_DEBUG_SYNC") == nullptr) {
+  if (std::getenv("HPC_FUSE_MOE_DEBUG_SYNC") == nullptr &&
+      std::getenv("CUDA_LAUNCH_BLOCKING") == nullptr) {
     return;
   }
   cudaError_t status = cudaStreamSynchronize(stream);
