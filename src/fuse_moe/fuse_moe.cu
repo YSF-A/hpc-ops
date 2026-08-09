@@ -4,12 +4,29 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "cute/tensor.hpp"
 #include "src/fuse_moe/fuse_moe.h"
 
 namespace hpc {
 namespace fuse_moe {
+
+namespace {
+
+void debug_sync_stage(cudaStream_t stream, const char *stage) {
+  if (std::getenv("HPC_FUSE_MOE_DEBUG_SYNC") == nullptr) {
+    return;
+  }
+  cudaError_t status = cudaStreamSynchronize(stream);
+  if (status != cudaSuccess) {
+    fprintf(stderr, "fuse_moe failed after %s: %s (%d)\n", stage,
+            cudaGetErrorString(status), static_cast<int>(status));
+    std::abort();
+  }
+}
+
+}  // namespace
 
 void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input_ptr,
                     void *gate_up_output_ptr, const void *gate_up_weight_ptr,
@@ -36,6 +53,7 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
       topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr,
       tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
       intermediate_size, num_topk, num_expert_local, rank_ep, num_seq_per_group_avg, stream);
+  debug_sync_stage(stream, "count_and_gather");
 
   // 1. gate/up projection and activation. The gated path writes the quantized
   // down input directly, avoiding the BF16 gate_up_output round trip.
@@ -59,6 +77,7 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
         (const float *)act_and_mul_scale_ptr, valid_row_range_ptr, total_num_seq,
         intermediate_size, use_bf16_mul, stream);
   }
+  debug_sync_stage(stream, do_gated_gemm ? "group_gated_gemm" : "group_gemm_and_activation");
 
   // 3. call down linear
   group_gemm::group_gemm_fp8_async(
@@ -66,9 +85,11 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
       down_tmas_ptr, tiles_ptr, cu_tiles_ptr, down_task_map_ptr, num_down_waves, num_expert_local,
       total_num_seq, hidden_size, intermediate_size / 2, num_seq_per_group_avg, false, use_pdl,
       stream);
+  debug_sync_stage(stream, "down_group_gemm");
 
   reduce_async(output_ptr, down_output_ptr, topk_pos_ptr, topk_scale_ptr, shared_output_ptr,
                total_num_seq, num_seq, hidden_size, num_topk, use_pdl, stream);
+  debug_sync_stage(stream, "reduce");
 }
 
 void fuse_moe_blockwise_async(
